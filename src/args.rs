@@ -14,7 +14,12 @@ pub enum Command {
         #[clap(subcommand)]
         command: ServerCommand,
     },
-    Cli,
+    Cli {
+        #[clap(default_value = "127.0.0.1")]
+        addr: IpAddr,
+        #[clap(default_value = "9988")]
+        port: u16,
+    },
 }
 
 #[derive(Debug, Subcommand)]
