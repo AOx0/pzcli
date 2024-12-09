@@ -3,19 +3,20 @@ use std::{process::Stdio, sync::Arc};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
     process::Command,
-    sync::{mpsc, oneshot, watch},
+    sync::{broadcast, mpsc, watch},
     task::JoinSet,
 };
 
 pub struct PZChild {
-    tx: mpsc::Sender<(String, oneshot::Sender<String>)>,
+    tx: mpsc::Sender<String>,
+    lines: tokio::sync::broadcast::Sender<Line>,
     handlers: JoinSet<()>,
 }
 
 impl PZChild {
     pub async fn new(notifier: Arc<watch::Sender<bool>>) -> Result<PZChild, std::io::Error> {
         let (tx, mut rx) = mpsc::channel(100);
-        let mut set = JoinSet::new();
+        let mut handlers = JoinSet::new();
 
         log::debug!("Starting ProjectZomboid64 process via start-server.sh");
         let mut pz = Command::new("bash")
@@ -30,28 +31,44 @@ impl PZChild {
         let stderr = pz.stderr.take();
         let stdin = pz.stdin.take().unwrap();
 
-        tokio::spawn(async move {
-            let status = pz.wait().await.expect("child process encountered an error");
-            log::error!("child status was: {}", status);
+        tokio::spawn({
+            let notifier = notifier.clone();
+            async move {
+                let status = pz.wait().await.expect("child process encountered an error");
+                notifier.send(true).unwrap();
+                log::error!("child status was: {}", status);
+            }
         });
 
-        set.spawn(handle_out_lines("stderr", stderr, Self::handle_log));
-        set.spawn(handle_out_lines("stdout", stdout, move |line| {
-            let msg = Self::handle_log(line);
-            if msg.contains("SERVER STARTED") {
-                notifier.send(true).unwrap();
-                log::info!("Server started!");
-            }
+        let (lines, _) = broadcast::channel(1500);
 
-            msg
-        }));
+        handlers.spawn(handle_out_lines(
+            "stderr",
+            stderr,
+            lines.clone(),
+            Self::handle_log,
+        ));
+        handlers.spawn(handle_out_lines(
+            "stdout",
+            stdout,
+            lines.clone(),
+            move |line| {
+                let msg = Self::handle_log(line);
+                if msg.msg.contains("SERVER STARTED") {
+                    notifier.send(true).unwrap();
+                    log::info!("Server started!");
+                }
 
-        set.spawn(async move {
+                msg
+            },
+        ));
+
+        handlers.spawn(async move {
             log::debug!("Starting Tokio task");
             let mut stdin = BufWriter::new(stdin);
 
             loop {
-                let Some((msg, tx)): Option<(String, _)> = rx.recv().await else {
+                let Some(msg): Option<String> = rx.recv().await else {
                     continue;
                 };
 
@@ -61,21 +78,24 @@ impl PZChild {
             }
         });
 
-        Ok(PZChild { tx, handlers: set })
+        Ok(PZChild {
+            tx,
+            handlers,
+            lines,
+        })
     }
 
-    pub async fn send(
-        &self,
-        cmd: String,
-        tx: oneshot::Sender<String>,
-    ) -> Result<(), mpsc::error::SendError<(String, oneshot::Sender<String>)>> {
-        self.tx.send((cmd, tx)).await
+    pub async fn send(&self, cmd: String) -> Result<(), mpsc::error::SendError<String>> {
+        self.tx.send(cmd).await
     }
 
-    fn handle_log(line: &str) -> &str {
+    pub fn subscribe(&self) -> broadcast::Receiver<Line> {
+        self.lines.subscribe()
+    }
+
+    fn handle_log(line: &str) -> Line {
         let Some((level, msg)) = line.split_once(":") else {
-            println!("{line}");
-            return line;
+            return Line::raw(line);
         };
         let msg = msg.trim();
 
@@ -83,46 +103,43 @@ impl PZChild {
             .iter()
             .any(|str| level.starts_with(str));
 
-        if is_log {
-            let level = level.trim();
-            let Some((from, msg)) = msg.split_once(",") else {
-                log::info!("{msg}");
-                return msg;
-            };
-            let msg = msg.trim();
-            let from = from.trim();
-
-            let Some((_, msg)) = msg.split_once(">") else {
-                log::info!("{msg}");
-                return msg;
-            };
-            let msg = msg.trim();
-
-            let Some((n, msg)) = msg.split_once(">") else {
-                log::info!("{msg}");
-                return msg;
-            };
-            let msg = msg.trim();
-
-            let n = n.trim().replace(",", "");
-            let n = n.parse::<u64>().unwrap_or_else(|err| {
-                log::error!("Invalid log number {n}. Error: {err}");
-                0
-            });
-
-            let msg = msg.trim();
-            match level.trim() {
-                "LOG" => log::info!("{n:x} {from}: {msg}"),
-                "WARN" => log::warn!("{n:x} {from}: {msg}"),
-                "ERROR" => log::error!("{n:x} {from}: {msg}"),
-                _ => log::debug!("{msg}"),
-            }
-
-            msg
-        } else {
-            println!("{line}");
-            line
+        if !is_log {
+            return Line::raw(line);
         }
+
+        let level = level.trim();
+        let Some((from, msg)) = msg.split_once(",") else {
+            return Line::log(msg, LineKind::Log);
+        };
+        let msg = msg.trim();
+        let from = from.trim();
+
+        let Some((_, msg)) = msg.split_once(">") else {
+            return Line::log(msg, LineKind::Log);
+        };
+        let msg = msg.trim();
+
+        let Some((n, msg)) = msg.split_once(">") else {
+            return Line::log(msg, LineKind::Log);
+        };
+        let msg = msg.trim();
+
+        let n = n.trim().replace(",", "");
+        let n = n.parse::<u64>().unwrap_or_else(|err| {
+            log::error!("Invalid log number {n}. Error: {err}");
+            0
+        });
+
+        let msg = msg.trim();
+
+        let level = match level.trim() {
+            "LOG" => LineKind::Log,
+            "WARN" => LineKind::Warn,
+            "ERROR" => LineKind::Error,
+            _ => return Line::raw(msg),
+        };
+
+        Line::log(&format!("{n:X} {from}: {msg}"), level)
     }
 }
 
@@ -131,7 +148,6 @@ impl Drop for PZChild {
         let mut handlers = JoinSet::new();
 
         std::mem::swap(&mut handlers, &mut self.handlers);
-
         tokio::spawn(async move {
             log::debug!("Waiting for all PZChild tasks");
             handlers.join_all().await;
@@ -139,10 +155,41 @@ impl Drop for PZChild {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum LineKind {
+    Log,
+    Error,
+    Warn,
+    Other,
+}
+
+#[derive(Debug, Clone)]
+pub struct Line {
+    pub kind: LineKind,
+    pub msg: String,
+}
+
+impl Line {
+    fn raw(msg: &str) -> Line {
+        Line {
+            kind: LineKind::Other,
+            msg: msg.to_string(),
+        }
+    }
+
+    fn log(msg: &str, kind: LineKind) -> Line {
+        Line {
+            kind,
+            msg: msg.to_string(),
+        }
+    }
+}
+
 async fn handle_out_lines(
     name: &str,
     out: Option<impl tokio::io::AsyncRead + std::marker::Unpin>,
-    on_line: impl Fn(&str) -> &str,
+    sender: broadcast::Sender<Line>,
+    on_line: impl Fn(&str) -> Line,
 ) {
     log::debug!("Starting {name:?} reader task");
 
@@ -160,7 +207,16 @@ async fn handle_out_lines(
             break;
         }
 
-        _ = on_line(line[..n].trim());
+        let value = on_line(line[..n].trim());
+
+        match value.kind {
+            LineKind::Log => log::info!("{}", value.msg),
+            LineKind::Error => log::error!("{}", value.msg),
+            LineKind::Warn => log::warn!("{}", value.msg),
+            LineKind::Other => println!("{}", value.msg),
+        };
+
+        let _ = sender.send(value); // We do not care if there are no listeners yet
         line.clear();
     }
 }

@@ -1,10 +1,10 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
     net::{TcpListener, TcpStream},
     select,
-    sync::{oneshot, watch},
+    sync::watch,
     task::JoinSet,
 };
 
@@ -84,26 +84,45 @@ async fn handle_connection(
     pz: Arc<PZChild>,
     stop: watch::Sender<bool>,
     start: watch::Receiver<bool>,
-    (mut stream, addr): (TcpStream, SocketAddr),
+    (stream, addr): (TcpStream, SocketAddr),
 ) {
     log::info!("New connection from {addr}");
 
-    log::debug!("Waiting writable");
-    stream.writable().await.unwrap();
+    let (reader, writer) = tokio::io::split(stream);
 
-    if !(*start.borrow()) {
-        stream
-            .write_all(b"Waiting for ProjectZomboid64 to start...\n")
-            .await
-            .unwrap();
+    tokio::spawn({
+        use crate::pz::LineKind;
 
-        while !(*start.borrow()) {
-            start.has_changed().unwrap();
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let mut out = pz.subscribe();
+        let mut writer = BufWriter::new(writer);
+
+        async move {
+            loop {
+                let Ok(value) = out.recv().await else {
+                    break;
+                };
+
+                match value.kind {
+                    LineKind::Log => writer
+                        .write_all((format!("INFO: {}", value.msg)).as_bytes())
+                        .await
+                        .unwrap(),
+                    LineKind::Error => writer
+                        .write_all((format!("ERROR: {}", value.msg)).as_bytes())
+                        .await
+                        .unwrap(),
+                    LineKind::Warn => writer
+                        .write_all((format!("WARN: {}", value.msg)).as_bytes())
+                        .await
+                        .unwrap(),
+                    LineKind::Other => writer.write_all(value.msg.as_bytes()).await.unwrap(),
+                }
+
+                writer.write_all(b"\n").await.unwrap();
+                writer.flush().await.unwrap();
+            }
         }
-
-        stream.write_all(b"Ready!\n").await.unwrap();
-    }
+    });
 
     log::info!("Waiting for messages from {addr}");
     let mut line = String::new();
@@ -111,7 +130,6 @@ async fn handle_connection(
     // log::debug!("Waiting readable");
     // stream.readable().await.unwrap();
 
-    let (reader, writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
 
     while let Ok(n) = reader.read_line(&mut line).await {
@@ -123,8 +141,7 @@ async fn handle_connection(
         let l = &line[..n];
         log::info!("{addr}: Got command: {l:?}");
 
-        let (tx, rx) = oneshot::channel();
-        pz.send(l.to_string(), tx).await.unwrap();
+        pz.send(l.to_string()).await.unwrap();
 
         if ["stop", "exit", "quit", "q"].contains(&l.trim()) {
             stop.send(true).unwrap();

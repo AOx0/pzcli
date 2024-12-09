@@ -26,7 +26,16 @@ pub async fn prompt(addr: IpAddr, port: u16) {
                 break;
             }
 
-            println!("{}", line.trim());
+            if let Some((_, msg)) = line.trim().split_once("WARN: ") {
+                log::warn!("{msg}");
+            } else if let Some((_, msg)) = line.trim().split_once("ERROR: ") {
+                log::error!("{msg}");
+            } else if let Some((_, msg)) = line.trim().split_once("INFO: ") {
+                log::info!("{msg}");
+            } else {
+                println!("{}", line.trim());
+            }
+
             line.clear();
         }
     });
