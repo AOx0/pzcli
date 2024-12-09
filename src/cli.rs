@@ -58,5 +58,5 @@ pub async fn prompt(addr: IpAddr, port: u16) {
         line.clear();
     }
 
-    handle.await.unwrap();
+    handle.abort();
 }

@@ -98,8 +98,16 @@ async fn handle_connection(
 
         async move {
             loop {
-                let Ok(value) = out.recv().await else {
-                    break;
+                let line = out.recv().await;
+                let Ok(value) = line else {
+                    match line.unwrap_err() {
+                        tokio::sync::broadcast::error::RecvError::Closed => break,
+                        tokio::sync::broadcast::error::RecvError::Lagged(_) => {
+                            log::debug!("Resuscribing to out");
+                            out = out.resubscribe();
+                            continue;
+                        }
+                    }
                 };
 
                 match value.kind {
