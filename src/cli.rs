@@ -6,10 +6,12 @@ use tokio::{
 };
 
 pub async fn prompt(addr: IpAddr, port: u16) {
+    log::debug!("Connecting to {addr:?}");
     let stream = TcpStream::connect((addr, port)).await.unwrap();
 
-    // log::debug!("Waiting for writable");
-    // stream.writable().await.unwrap();
+    log::debug!("Waiting for writable");
+    stream.writable().await.unwrap();
+    log::info!("Connected to {addr:?}");
 
     let mut in_reader = BufReader::new(tokio::io::stdin());
     let mut line = String::new();

@@ -1,5 +1,7 @@
 // #![deny(clippy::unwrap_used)]
 
+use std::env;
+
 use args::Args;
 use clap::Parser;
 
@@ -11,6 +13,10 @@ mod server;
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+
+    if env::var("RUST_LOG").is_err() {
+        env::set_var("RUST_LOG", "info")
+    }
     env_logger::init();
 
     log::debug!("Args: {:?}", args);
