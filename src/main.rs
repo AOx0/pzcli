@@ -1,4 +1,6 @@
 // #![deny(clippy::unwrap_used)]
+#[cfg(not(target_os = "linux"))]
+compile_error!("This application only supports Linux");
 
 use std::env;
 
